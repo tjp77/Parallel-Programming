@@ -1,0 +1,328 @@
+#include <iostream>
+#include <vector>
+#include <fstream>
+#include <sstream>
+#include <algorithm>
+#include <mpi.h>
+
+using std::string;
+using std::cout;
+using std::endl;
+using std::cin;
+using std::vector;
+
+void DistributeFileData(string fileName, int grid[64]);
+void stringSplit(string stringtoSplit, string (&stringParts)[2] , char delim);
+void clearArray(string (&stringArray)[2]);
+void AdvanceGenerationCycle(int grid[64], const int lowerAdjacents[16], const int higherAdjacents[16], int myRank);
+void LogFinalWorld(const int lastWorld[256]);
+
+MPI_Comm comm;
+
+int main(int argc, char* argv[])
+{
+    int myRank, commSize, iterations;
+    int grid[64];
+    int lowerAdjacents[16], higherAdjacents[16];
+
+    // Create gods of each region.
+    MPI_Init(&argc, &argv);
+    MPI_Status status;
+    MPI_Win lowerWindow, upperWindow;
+    comm = MPI_COMM_WORLD;
+    MPI_Comm_rank(comm, &myRank);
+
+    MPI_Comm_size(comm, &commSize);
+
+    if (argc != 3)
+    {
+		if (myRank == 0)
+        { cout << "Incorrect program arguments. \nFormat: inputFile.txt #-iterations." << endl; }
+
+        MPI_Finalize();
+        return -1;
+    }
+
+    // Create world.
+    if (myRank == 0)
+    { 
+		DistributeFileData(argv[1], grid); 
+	}
+    else
+    { 
+		MPI_Recv(grid, 64, MPI_INT, 0, 0, comm, &status);
+    }
+
+    iterations = std::stoi(argv[2]);
+
+    // Open border regions to neighbors.
+    // No one writes to neighbor's data, so let everyone just read
+    // the info they need without waiting to pass back and forth.
+    // ...and I just wanted to learn RMA. 
+    int sharedAmount = 16;
+
+	// If have neighbors above that need upper border...
+    if (myRank == 0)
+    { sharedAmount = 0; }
+
+    MPI_Win_create(grid, sharedAmount * sizeof(int), sizeof(int), MPI_INFO_NULL, comm, &upperWindow);
+
+    sharedAmount = 16;
+
+    // If have neighbors below that need lower border...
+    if (myRank == 3)
+    { sharedAmount = 0; }
+
+    MPI_Win_create(&grid[48], sharedAmount * sizeof(int), sizeof(int), MPI_INFO_NULL, comm, &lowerWindow); 
+
+    MPI_Barrier(comm); 
+
+    // Advance time by specified number of generations.
+    for (int i = 0; i < iterations; i++)
+    {
+        // Send border regions to neighbors along them.
+        MPI_Win_fence(0, upperWindow);
+
+        // If not at world bottom, get Southern sector's upper border.
+        if (myRank != 3)
+        { 
+			MPI_Get(lowerAdjacents, 16, MPI_INT, myRank + 1, 0, 16, MPI_INT, upperWindow); 
+		}
+
+        MPI_Win_fence(0, upperWindow);            
+        MPI_Win_fence(0, lowerWindow);
+
+        // If not at world top, get Northern sector's lower border.
+        if (myRank != 0)
+        { 
+			MPI_Get(higherAdjacents, 16, MPI_INT, myRank - 1, 0, 16, MPI_INT, lowerWindow); 
+		}
+
+        MPI_Win_fence(0, lowerWindow);
+
+        // Command own region.
+        AdvanceGenerationCycle(grid, lowerAdjacents, higherAdjacents, myRank);
+    }
+
+    MPI_Barrier(comm);
+
+	// Record last state the world reaches. 
+    if (myRank == 0)
+    {
+        int lastWorld[256];
+		
+        for (int i = 0; i < 64; i++)
+        { lastWorld[i] = grid[i]; }
+
+        for (int i = 1; i < 4; i++)
+        {
+            int outerRegion[64];
+
+            MPI_Recv(outerRegion, 64, MPI_INT, i, 0, comm, &status);
+
+            for (int j = 0; j < 64; j++)
+            { lastWorld[(64 * i) + j] = outerRegion[j]; }
+        }
+
+         LogFinalWorld(lastWorld);
+    }
+    else
+    { MPI_Send(grid, 64, MPI_INT, 0, 0, comm); }
+
+    // The end of times.
+	MPI_Win_free(&lowerWindow);
+    MPI_Win_free(&upperWindow);
+    MPI_Finalize();
+    return 0;
+}
+
+
+void DistributeFileData(string fileName, int grid[64])
+{
+    string line, parts[2];
+
+    int fullGrid[256] = {0};
+
+    std::ifstream ifs;
+    ifs.open(fileName);
+
+    if (ifs.is_open() == false)
+    {
+        cout << "Error, " << fileName << " could not be opened." << endl;
+    }
+    else
+    {
+        int x, y;
+
+        while (getline(ifs, line))
+        {
+            stringSplit(line, parts, ' ');
+            std::stringstream strs1, strs2;
+
+            strs1 << parts[0];
+            strs1 >> x;
+            strs2 << parts[1];
+            strs2 >> y;
+			
+            if (x == -1)
+            { break; }
+
+            fullGrid[(y * 16) + x] = 1;
+            clearArray(parts);
+        }
+
+        for (int i = 0; i < 64; i++)
+        { grid[i] = fullGrid[i]; }
+
+        // Send last 3/4 of the world to other processors, as assigned.
+        MPI_Send(&fullGrid[64], 64, MPI_INT, 1, 0, comm);
+        MPI_Send(&fullGrid[128], 64, MPI_INT, 2, 0, comm);
+        MPI_Send(&fullGrid[192], 64, MPI_INT, 3, 0, comm);
+    }
+}
+
+
+
+void stringSplit(string stringtoSplit, string (&stringParts)[2], char delim)
+{
+    int j = 0;
+
+    for (unsigned int i = 0; i < stringtoSplit.length(); i++)
+    {
+        if (stringtoSplit[i] != delim)
+        {
+           stringParts[j] += (char)stringtoSplit[i];
+        }
+        else
+        { j++; }
+    }
+}
+
+
+void clearArray(string (&stringArray)[2])
+{
+    for(int i = 0; i < 2; i++)
+    {
+        stringArray[i].clear();
+    }
+}
+
+
+void AdvanceGenerationCycle(int grid[64], const int lowerAdjacents[16], const int higherAdjacents[16], int myRank)
+{
+        int newGen[64] = {0};
+
+        // Determine number of neighboring sectors.
+        for (int i = 0; i < 64; ++i)
+        {
+            int neighbors = 0;
+
+            // West and East neighbors, if not at a world edge.
+            if (i != 0 && i != 16 && i != 32 && i != 48)
+            { 
+				neighbors += grid[i - 1]; 
+			}
+
+            if (i != 15 && i != 31 && i != 47 && i != 63)
+            { 
+				neighbors += grid[i + 1]; 
+			}
+
+            // If not at top of world with no upper neighbors...
+
+            // If at the top of my area, must check neighbor's border lands.
+            if (i < 16)
+            {
+                if(myRank != 0)
+                {
+                    neighbors += higherAdjacents[i];
+
+                    // North-West neighbor.
+                    if (i != 0)
+                    { neighbors += higherAdjacents[i - 1]; }
+
+                    // North-East neighbor.
+                    if (i != 15)
+                    { neighbors += higherAdjacents[i + 1]; }
+                }
+            }
+            else
+            {
+                neighbors += grid[i - 16];
+
+                // North-West neighbor.
+                if (i != 0)
+                { neighbors += grid[i - 16 - 1]; }
+
+				// North-East neighbor.
+                if (i != 15)
+                { neighbors += grid[i - 16 + 1]; }
+                
+		    }
+			
+            // If not at bottom of world with no lower neighbors...
+
+            // If at the bottom of my area, must check neighbor's border lands.
+            if (i >= 48)
+            {
+				if (myRank != 3) // fixed
+                {
+					neighbors += lowerAdjacents[i - 48];
+
+                     // South-West neighbor.
+                     if (i - 48 != 0)
+                     { neighbors += lowerAdjacents[i - 48 - 1]; }
+
+                     // Southth-East neighbor.
+                    if (i != 15)
+                    { neighbors += lowerAdjacents[i - 48 + 1]; }
+                }
+            }
+            else
+            {
+                neighbors += grid[i + 16];
+
+                // South-West neighbor.
+                if (i != 0)
+                { neighbors += grid[i + 16 - 1]; }
+
+                // Southth-East neighbor.
+                if (i != 15)
+                { neighbors += grid[i + 16 + 1]; }
+            }
+
+            // Determine this sector's fate.
+            if (grid[i] == 1 && (neighbors == 0 || neighbors >= 4))
+            {
+                newGen[i] = 0;
+            }
+            else if ((neighbors == 3) || (grid[i] == 1 && neighbors == 2))
+            {
+                newGen[i] = 1;
+            }
+
+        }
+
+        for (int i = 0; i < 64; i++)
+        { grid[i] = newGen[i]; }
+}
+
+
+void LogFinalWorld(const int lastWorld[256])
+{
+    std::ofstream ofs;
+    ofs.open("LastWorld.txt");
+
+    if (ofs.is_open() == false)
+    {
+        cout << "Error, output file could not be created." << endl;
+    }
+    else
+    {
+        for (int i = 0; i < 256; i++)
+        {
+            if (lastWorld[i] == 1)
+            { ofs << (i % 16) << "\t" << (i / 16) << endl; }
+        }
+    }
+}
